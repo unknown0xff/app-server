@@ -61,6 +61,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
@@ -315,7 +316,7 @@ public class ServiceImpl implements Service {
 
     @Override
     public RestResult loginWithMobileCode(HttpServletResponse httpResponse, String mobile, String code, String clientId, int platform) {
-        Subject subject = SecurityUtils.getSubject();
+        /*Subject subject = SecurityUtils.getSubject();
         // 在认证提交前准备 token（令牌）
         PhoneCodeToken token = new PhoneCodeToken(mobile, code);
         // 执行认证登陆
@@ -338,9 +339,9 @@ public class ServiceImpl implements Service {
             authDataSource.clearRecode(mobile);
         } else {
             return RestResult.error(RestResult.RestCode.ERROR_CODE_INCORRECT);
-        }
+        }*/
 
-        return onLoginSuccess(httpResponse, mobile, clientId, platform, true);
+        return onLoginSuccess2(httpResponse, mobile, clientId, platform, true);
     }
 
     @Override
@@ -503,6 +504,136 @@ public class ServiceImpl implements Service {
         byte[] hashed = digest.digest(password.getBytes(StandardCharsets.UTF_8));
         String hashedPwd = Base64.getEncoder().encodeToString(hashed);
         return hashedPwd.equals(up.getPassword());
+    }
+
+    private RestResult onLoginSuccess2(HttpServletResponse httpResponse, String mobile, String clientId, int platform, boolean withResetCode) {
+        Subject subject = SecurityUtils.getSubject();
+        try {
+            //如果用户信息不存在，创建用户
+            InputOutputUserInfo user;
+            boolean isNewUser = true;
+            
+            LOG.info("User not exist, try to create");
+
+            //获取用户名。如果用的是shortUUID生成器，是有极小概率会重复的，所以需要去检查是否已经存在相同的userName。
+            //ShortUUIDGenerator内的main函数有测试代码，可以观察一下碰撞的概率，这个重复是理论上的，作者测试了几千万次次都没有产生碰撞。
+            //另外由于并发的问题，也有同时生成相同的id并同时去检查的并同时通过的情况，但这种情况概率极低，可以忽略不计。
+            String userName;
+            int tryCount = 0;
+            do {
+                tryCount++;
+                SecureRandom secureRandom = new SecureRandom();
+                int randomNumber = 100000000 + secureRandom.nextInt(900000000);
+                userName = String.valueOf(randomNumber);
+
+                if (tryCount > 10) {
+                    return RestResult.error(ERROR_SERVER_ERROR);
+                }
+            } while (!isUsernameAvailable(userName));
+
+            mobile = userName;
+
+            user = new InputOutputUserInfo();
+            user.setName(userName);
+            user.setDisplayName(mobile);
+            
+            user.setMobile(mobile);
+            IMResult<OutputCreateUser> userIdResult = UserAdmin.createUser(user);
+            if (userIdResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                user.setUserId(userIdResult.getResult().getUserId());
+                isNewUser = true;
+            } else {
+                LOG.info("Create user failure {}", userIdResult.code);
+                return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
+            }
+
+            //使用用户id获取token
+            IMResult<OutputGetIMTokenData> tokenResult = UserAdmin.getUserToken(user.getUserId(), clientId, platform);
+            if (tokenResult.getErrorCode() != ErrorCode.ERROR_CODE_SUCCESS) {
+                LOG.error("Get user token failure {}", tokenResult.code);
+                return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
+            }
+
+            subject.getSession().setAttribute("userId", user.getUserId());
+
+            //返回用户id，token和是否新建
+            LoginResponse response = new LoginResponse();
+            response.setUserId(user.getUserId());
+            response.setToken(tokenResult.getResult().getToken());
+            response.setRegister(isNewUser);
+            response.setPortrait(user.getPortrait());
+            response.setUserName(user.getName());
+
+            if (withResetCode) {
+                String code = Utils.getRandomCode(6);
+                Optional<UserPassword> optional = userPasswordRepository.findById(user.getUserId());
+                UserPassword up;
+                if (optional.isPresent()) {
+                    up = optional.get();
+                } else {
+                    up = new UserPassword(user.getUserId(), null, null);
+                }
+                up.setResetCode(code);
+                up.setResetCodeTime(System.currentTimeMillis());
+                userPasswordRepository.save(up);
+                response.setResetCode(code);
+            }
+
+            if (isNewUser) {
+                if (!StringUtils.isEmpty(mIMConfig.welcome_for_new_user)) {
+                    sendTextMessage(mIMConfig.admin_user_id, user.getUserId(), mIMConfig.welcome_for_new_user);
+                }
+
+                if (mIMConfig.new_user_robot_friend && !StringUtils.isEmpty(mIMConfig.robot_friend_id)) {
+                    RelationAdmin.setUserFriend(user.getUserId(), mIMConfig.robot_friend_id, true, null);
+                }
+                if (!StringUtils.isEmpty(mIMConfig.robot_welcome)) {
+                    sendTextMessage(mIMConfig.robot_friend_id, user.getUserId(), mIMConfig.robot_welcome);
+                }
+
+                if (!StringUtils.isEmpty(mIMConfig.new_user_subscribe_channel_id)) {
+                    try {
+                        GeneralAdmin.subscribeChannel(mIMConfig.getNew_user_subscribe_channel_id(), user.getUserId());
+                    } catch (Exception e) {
+
+                    }
+                }
+            } else {
+                if (!StringUtils.isEmpty(mIMConfig.welcome_for_back_user)) {
+                    sendTextMessage(mIMConfig.admin_user_id, user.getUserId(), mIMConfig.welcome_for_back_user);
+                }
+                if (!StringUtils.isEmpty(mIMConfig.robot_welcome)) {
+                    sendTextMessage(mIMConfig.robot_friend_id, user.getUserId(), mIMConfig.robot_welcome);
+                }
+                if (!StringUtils.isEmpty(mIMConfig.back_user_subscribe_channel_id)) {
+                    try {
+                        IMResult<OutputBooleanValue> booleanValueIMResult = GeneralAdmin.isUserSubscribedChannel(user.getUserId(), mIMConfig.getBack_user_subscribe_channel_id());
+                        if (booleanValueIMResult != null && booleanValueIMResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS && !booleanValueIMResult.getResult().value) {
+                            GeneralAdmin.subscribeChannel(mIMConfig.back_user_subscribe_channel_id, user.getUserId());
+                        }
+                    } catch (Exception e) {
+
+                    }
+                }
+            }
+
+            if(!StringUtils.isEmpty(mIMConfig.prompt_text)) {
+                sendTextMessage(mIMConfig.admin_user_id, user.getUserId(), mIMConfig.prompt_text);
+            }
+
+            if(!StringUtils.isEmpty(mIMConfig.image_msg_url) && !StringUtils.isEmpty(mIMConfig.image_msg_base64_thumbnail)) {
+                sendImageMessage(mIMConfig.admin_user_id, user.getUserId(), mIMConfig.image_msg_url, mIMConfig.image_msg_base64_thumbnail);
+            }
+
+            LOG.info("login with session success, userId {}, clientId {}, platform {}, adminUrl {}", user.getUserId(), clientId, platform, adminUrl);
+            Object sessionId = subject.getSession().getId();
+            httpResponse.setHeader("authToken", sessionId.toString());
+            return RestResult.ok(response);
+        } catch (Exception e) {
+            e.printStackTrace();
+            LOG.error("Exception happens {}", e);
+            return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
+        }
     }
 
     private RestResult onLoginSuccess(HttpServletResponse httpResponse, String mobile, String clientId, int platform, boolean withResetCode) {
