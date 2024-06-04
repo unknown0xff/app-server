@@ -509,44 +509,52 @@ public class ServiceImpl implements Service {
     private RestResult onLoginSuccess2(HttpServletResponse httpResponse, String mobile, String clientId, int platform, boolean withResetCode) {
         Subject subject = SecurityUtils.getSubject();
         try {
+            //使用电话号码查询用户信息。
+            IMResult<InputOutputUserInfo> userResult = UserAdmin.getUserByMobile(mobile);
+
             //如果用户信息不存在，创建用户
             InputOutputUserInfo user;
-            boolean isNewUser = true;
-            
-            LOG.info("User not exist, try to create");
+            boolean isNewUser = false;
+            if (userResult.getErrorCode() == ErrorCode.ERROR_CODE_NOT_EXIST) {
+                LOG.info("User not exist, try to create");
 
-            //获取用户名。如果用的是shortUUID生成器，是有极小概率会重复的，所以需要去检查是否已经存在相同的userName。
-            //ShortUUIDGenerator内的main函数有测试代码，可以观察一下碰撞的概率，这个重复是理论上的，作者测试了几千万次次都没有产生碰撞。
-            //另外由于并发的问题，也有同时生成相同的id并同时去检查的并同时通过的情况，但这种情况概率极低，可以忽略不计。
-            String userName;
-            int tryCount = 0;
-            do {
-                tryCount++;
-                SecureRandom secureRandom = new SecureRandom();
-                int randomNumber = 100000000 + secureRandom.nextInt(900000000);
-                userName = String.valueOf(randomNumber);
+                //获取用户名。如果用的是shortUUID生成器，是有极小概率会重复的，所以需要去检查是否已经存在相同的userName。
+                //ShortUUIDGenerator内的main函数有测试代码，可以观察一下碰撞的概率，这个重复是理论上的，作者测试了几千万次次都没有产生碰撞。
+                //另外由于并发的问题，也有同时生成相同的id并同时去检查的并同时通过的情况，但这种情况概率极低，可以忽略不计。
+                String userName;
+                int tryCount = 0;
+                do {
+                    tryCount++;
+                    SecureRandom secureRandom = new SecureRandom();
+                    int randomNumber = 100000000 + secureRandom.nextInt(900000000);
+                    userName = String.valueOf(randomNumber);
+                    if (tryCount > 10) {
+                        return RestResult.error(ERROR_SERVER_ERROR);
+                    }
+                } while (!isUsernameAvailable(userName));
 
-                if (tryCount > 10) {
-                    return RestResult.error(ERROR_SERVER_ERROR);
+                user = new InputOutputUserInfo();
+                mobile = userName;
+                user.setName(userName);
+                user.setDisplayName(mobile);
+                user.setMobile(mobile);
+
+                IMResult<OutputCreateUser> userIdResult = UserAdmin.createUser(user);
+                if (userIdResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                    user.setUserId(userIdResult.getResult().getUserId());
+                    isNewUser = true;
+                } else {
+                    LOG.info("Create user failure {}", userIdResult.code);
+                    return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
                 }
-            } while (!isUsernameAvailable(userName));
 
-            mobile = userName;
-
-            user = new InputOutputUserInfo();
-            user.setName(userName);
-            user.setDisplayName(mobile);
-            
-            user.setMobile(mobile);
-            IMResult<OutputCreateUser> userIdResult = UserAdmin.createUser(user);
-            if (userIdResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
-                user.setUserId(userIdResult.getResult().getUserId());
-                isNewUser = true;
-            } else {
-                LOG.info("Create user failure {}", userIdResult.code);
+            } else if (userResult.getCode() != 0) {
+                LOG.error("Get user failure {}", userResult.code);
                 return RestResult.error(RestResult.RestCode.ERROR_SERVER_ERROR);
+            } else {
+                user = userResult.getResult();
             }
-
+        
             //使用用户id获取token
             IMResult<OutputGetIMTokenData> tokenResult = UserAdmin.getUserToken(user.getUserId(), clientId, platform);
             if (tokenResult.getErrorCode() != ErrorCode.ERROR_CODE_SUCCESS) {
